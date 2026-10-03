@@ -66,6 +66,7 @@ if __name__ == "__main__":
     print(crash_hours.round(2).tail(10))
 
 
+
     print("--- SQUEEZE check (per coin) ---")
     for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT"]:
         df_1h = add_bollinger(fetch_candles(exchange, symbol, "1h", limit=1000))
