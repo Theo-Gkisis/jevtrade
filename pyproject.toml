@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ccxt>=4.4",
     "pandas>=2.2",
+    "TA-Lib>=0.6",
 ]
 
 [tool.setuptools.packages.find]
