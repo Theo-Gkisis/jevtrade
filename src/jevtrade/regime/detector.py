@@ -23,6 +23,7 @@ class RegimeParams:
     chaos_cooldown_hours: int = 12     # stay in CHAOS this long after a crash
     squeeze_lookback_hours: int = 720  # 30 days of 1h candles
     squeeze_percentile: float = 10.0   # bb_width in the narrowest X% of the lookback = SQUEEZE
+    squeeze_recent_candles: int = 3    # stay SQUEEZE for a few candles so the breakout candle still counts
     trend_adx_min: float = 20.0        # ADX(4h) above this = a real trend
     range_adx_max: float = 20.0        # ADX(4h) below this = no clear direction
     range_lookback_hours: int = 48     # window for measuring the channel
@@ -52,8 +53,14 @@ def bb_width_percentile(df_1h: pd.DataFrame, lookback_hours: int) -> float:
 
 
 def is_squeeze(df_1h: pd.DataFrame, params: RegimeParams) -> bool:
-    """True if the latest 1h Bollinger width is among the narrowest of the lookback window."""
-    return bb_width_percentile(df_1h, params.squeeze_lookback_hours) < params.squeeze_percentile
+    """True if the 1h Bollinger width was among the narrowest of the lookback in any of the last few candles.
+
+    Looking a few candles back keeps SQUEEZE active on the breakout candle itself,
+    whose bands are already widening.
+    """
+    widths = df_1h["bb_width"].dropna()
+    threshold = widths.tail(params.squeeze_lookback_hours).quantile(params.squeeze_percentile / 100)
+    return bool((widths.tail(params.squeeze_recent_candles) <= threshold).any())
 
 
 def is_trend(df_4h: pd.DataFrame, params: RegimeParams) -> bool:
