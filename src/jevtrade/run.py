@@ -20,6 +20,8 @@ from jevtrade.data.candles import create_exchange, fetch_candles
 from jevtrade.execution.demo import create_demo_exchange
 from jevtrade.execution.orders import cancel_oco, market_buy, place_exit_oco
 from jevtrade.indicators.technical import add_adx, add_atr, add_bollinger, add_ema, add_rsi, add_volume_ma
+from jevtrade.jev.client import JevAssessment, JevClient, build_state
+from jevtrade.jev.policy import JevDecision, JevPolicyParams, decide
 from jevtrade.regime.detector import RegimeParams, detect_regime
 from jevtrade.risk.limits import LimitParams, check_limits
 from jevtrade.risk.sizing import SizingParams, position_size
@@ -30,9 +32,11 @@ from jevtrade.storage.repository import (
     close_position,
     open_positions,
     portfolio_state,
+    record_jev_decision,
     record_signal,
     signal_exists,
 )
+from jevtrade.strategies.signal import Signal
 from jevtrade.strategies.router import StrategyParams, find_signal
 
 log = logging.getLogger("jevtrade")
@@ -44,7 +48,9 @@ class BotParams:
     time_stop_hours: int = 48       # exit if neither stop nor target was hit after this long
     breakeven_at_r: float = 1.0     # move the stop to entry once the price has gone this many R up
     fee_pct: float = 0.1            # used to estimate exit fees (Binance spot taker fee)
+    jev_mode: str = "enforce"       # "enforce": Jev can veto or shrink trades; "off": rules only
     regime: RegimeParams = field(default_factory=RegimeParams)
+    jev_policy: JevPolicyParams = field(default_factory=JevPolicyParams)
     strategies: StrategyParams = field(default_factory=StrategyParams)
     sizing: SizingParams = field(default_factory=SizingParams)
     limits: LimitParams = field(default_factory=LimitParams)
@@ -126,6 +132,38 @@ def sync_with_exchange(session: Session, exchange: ccxt.binance, position: Posit
     return False
 
 
+# --- Jev ---------------------------------------------------------------------------------------
+
+
+def ask_jev(
+    jev: JevClient | None, signal: Signal, regime: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame, params: BotParams
+) -> tuple[dict, JevAssessment | None, JevDecision, str | None]:
+    """Ask Jev about a signal and apply our policy. Any failure means reject (fail-closed).
+
+    Returns (state sent, Jev's answer or None, our decision, error text or None).
+    """
+    state = build_state(signal, df_1h, df_4h, max_holding_hours=params.time_stop_hours)
+    is_breakout = signal.strategy == "breakout"
+    assessment, error = None, None
+    if jev is None:
+        error = "Jev client not configured"
+    else:
+        try:
+            assessment = jev.assess(state, is_breakout=is_breakout)
+        except Exception as exc:  # network, HTTP error, unexpected answer format: all fail closed
+            error = f"{type(exc).__name__}: {exc}"
+    decision = decide(assessment, regime, is_breakout, params.jev_policy)
+    if assessment:
+        log.info(
+            "JEV %s regime=%s (%.2f) target_p=%.2f news=%.2f -> %s x%.1f %s",
+            signal.symbol, assessment.regime, assessment.regime_confidence, assessment.target_probability,
+            assessment.news_risk, decision.action, decision.risk_multiplier, "; ".join(decision.reasons),
+        )
+    else:
+        log.warning("JEV %s unavailable (%s) -> reject", signal.symbol, error)
+    return state, assessment, decision, error
+
+
 # --- the two halves of the hourly cycle ----------------------------------------------------------
 
 
@@ -177,8 +215,15 @@ def look_for_signals(
     params: BotParams,
     now: datetime,
 ) -> None:
-    """Entries: regime -> strategy -> risk limits -> market buy + protective OCO."""
+    """Entries: regime -> strategy -> Jev -> risk limits -> market buy + protective OCO."""
     btc_1h = data["BTC/USDT"][0]
+    jev = None
+    if params.jev_mode == "enforce":
+        try:
+            jev = JevClient()
+        except RuntimeError as exc:
+            log.error("Jev client unavailable (%s): every signal will be rejected (fail-closed)", exc)
+
     for symbol in params.symbols:
         df_1h, df_4h = data[symbol]
         regime = detect_regime(symbol, btc_1h, df_1h, df_4h, params.regime)
@@ -187,8 +232,20 @@ def look_for_signals(
         if signal is None or signal_exists(session, signal):
             continue
 
+        # Second opinion: Jev may veto the trade or shrink its risk, never enlarge it
+        jev_review = None
+        if params.jev_mode == "enforce":
+            jev_review = ask_jev(jev, signal, regime, df_1h, df_4h, params)
+            state, assessment, decision, error = jev_review
+            if decision.action == "reject":
+                signal_row = record_signal(session, signal, regime, "jev_reject", "; ".join(decision.reasons))
+                record_jev_decision(session, signal_row, state, assessment, decision, error)
+                session.commit()
+                continue
+        risk_multiplier = jev_review[2].risk_multiplier if jev_review else 1.0
+
         equity = account_equity(exchange, prices)
-        size = position_size(signal, equity, params.sizing)
+        size = position_size(signal, equity, params.sizing, risk_pct=params.sizing.risk_per_trade_pct * risk_multiplier)
         reasons = check_limits(symbol, size.risk_pct, portfolio_state(session, equity, prices, now), params.limits)
         cost = size.quantity * signal.entry
         free_usdt = exchange.fetch_balance()["free"].get("USDT", 0.0)
@@ -198,7 +255,10 @@ def look_for_signals(
         if cost < min_cost:
             reasons.append(f"order of {cost:.2f} USDT is below the exchange minimum {min_cost}")
         if reasons:
-            record_signal(session, signal, regime, "blocked", "; ".join(reasons))
+            signal_row = record_signal(session, signal, regime, "blocked", "; ".join(reasons))
+            if jev_review:
+                record_jev_decision(session, signal_row, jev_review[0], jev_review[1], jev_review[2], jev_review[3])
+            session.commit()
             log.info("BLOCKED %s: %s", symbol, "; ".join(reasons))
             continue
 
@@ -207,6 +267,8 @@ def look_for_signals(
         fee_usdt, fee_in_coin = fees_of(buy, symbol, fill)
         quantity = float(exchange.amount_to_precision(symbol, buy["filled"] - fee_in_coin))
         signal_row = record_signal(session, signal, regime, "opened")
+        if jev_review:
+            record_jev_decision(session, signal_row, jev_review[0], jev_review[1], jev_review[2], jev_review[3])
         position = add_position(session, signal_row, now, fill, quantity, fee_usdt, str(buy["id"]), None)
         log.info("BUY %s qty=%s @ %.2f (cost %.2f USDT) stop=%.2f target=%.2f", symbol, quantity, fill, buy["cost"], signal.stop, signal.target)
 
@@ -253,6 +315,7 @@ def main() -> None:
     parser.add_argument("--loop", action="store_true", help="keep running, once per hour")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per HTTP request is noise
     params = BotParams()
 
     while True:

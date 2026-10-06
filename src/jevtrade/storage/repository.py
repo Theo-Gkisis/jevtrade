@@ -7,8 +7,10 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from jevtrade.jev.client import JevAssessment
+from jevtrade.jev.policy import JevDecision
 from jevtrade.risk.limits import PortfolioState
-from jevtrade.storage.models import PositionRow, SignalRow, TradeRow
+from jevtrade.storage.models import JevDecisionRow, PositionRow, SignalRow, TradeRow
 from jevtrade.strategies.signal import Signal
 
 
@@ -40,6 +42,38 @@ def record_signal(
     )
     session.add(row)
     session.flush()  # assigns row.id
+    return row
+
+
+def record_jev_decision(
+    session: Session,
+    signal_row: SignalRow,
+    state: dict,
+    assessment: JevAssessment | None,
+    decision: JevDecision,
+    error: str | None = None,
+) -> JevDecisionRow:
+    """Store what we asked Jev, what it answered (or why it failed) and what our policy decided."""
+    a = assessment
+    row = JevDecisionRow(
+        signal_id=signal_row.id,
+        model=a.raw.get("model") if a else None,
+        state=state,
+        response=a.raw if a else None,
+        jev_regime=a.regime if a else None,
+        regime_confidence=a.regime_confidence if a else None,
+        target_probability=a.target_probability if a else None,
+        news_risk=a.news_risk if a else None,
+        breakout_genuine=a.breakout_genuine if a else None,
+        action=decision.action,
+        risk_multiplier=decision.risk_multiplier,
+        reasons="; ".join(decision.reasons) or None,
+        latency_ms=a.latency_ms if a else None,
+        cost_usd=a.cost_usd if a else None,
+        error=error[:500] if error else None,
+    )
+    session.add(row)
+    session.flush()
     return row
 
 

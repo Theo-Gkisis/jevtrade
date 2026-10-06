@@ -71,6 +71,30 @@ class TradeRow(Base):
     exit_reason: Mapped[str] = mapped_column(String(20))   # "target", "stop", "breakeven", "time", "news", "monthly_limit"
 
 
+class JevDecisionRow(Base):
+    """Every question sent to Jev for a signal, its answer, and the decision our policy took."""
+
+    __tablename__ = "jev_decisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    signal_id: Mapped[int] = mapped_column(ForeignKey("signals.id"), index=True)
+    model: Mapped[str | None] = mapped_column(String(60))            # model that answered, None on error
+    state: Mapped[dict] = mapped_column(JSON)                        # what we sent
+    response: Mapped[dict | None] = mapped_column(JSON)              # full answer, None on error
+    jev_regime: Mapped[str | None] = mapped_column(String(10))
+    regime_confidence: Mapped[float | None]
+    target_probability: Mapped[float | None]
+    news_risk: Mapped[float | None]                                  # 0 = none ... 3 = high
+    breakout_genuine: Mapped[float | None]                           # only for breakout signals
+    action: Mapped[str] = mapped_column(String(10))                  # "approve", "reduce" or "reject"
+    risk_multiplier: Mapped[float]
+    reasons: Mapped[str | None] = mapped_column(String(1000))
+    latency_ms: Mapped[int | None]
+    cost_usd: Mapped[float | None]
+    error: Mapped[str | None] = mapped_column(String(500))           # why Jev could not be reached
+
+
 def create_tables(engine: Engine) -> None:
     """Create any missing tables. Existing tables and their data are left untouched."""
     Base.metadata.create_all(engine)
@@ -87,6 +111,6 @@ if __name__ == "__main__":
     engine = create_db_engine()
     create_tables(engine)
     inspector = inspect(engine)
-    for table in ("signals", "positions", "trades"):
+    for table in ("signals", "positions", "trades", "jev_decisions"):
         columns = [c["name"] for c in inspector.get_columns(table)]
         print(f"{table:<10} {len(columns)} columns: {', '.join(columns)}")
