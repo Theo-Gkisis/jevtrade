@@ -76,6 +76,28 @@ def is_range(df_4h: pd.DataFrame, df_1h: pd.DataFrame, symbol: str, params: Regi
     return bool(weak_trend and width < params.range_max_width_pct[symbol])
 
 
+def detect_regime(
+    symbol: str,
+    btc_1h: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    df_4h: pd.DataFrame,
+    params: RegimeParams,
+) -> Regime:
+    """Return the single regime for `symbol`, checking in priority order.
+
+    Expects df_1h with `bb_width` and df_4h with `ema_50` and `adx_14` already added.
+    """
+    if is_chaos(btc_1h, params):
+        return Regime.CHAOS
+    if is_squeeze(df_1h, params):
+        return Regime.SQUEEZE
+    if is_trend(df_4h, params):
+        return Regime.TREND
+    if is_range(df_4h, df_1h, symbol, params):
+        return Regime.RANGE
+    return Regime.NONE
+
+
 if __name__ == "__main__":
     from jevtrade.data.candles import create_exchange, fetch_candles
     from jevtrade.indicators.technical import add_adx, add_bollinger, add_ema
@@ -83,38 +105,17 @@ if __name__ == "__main__":
     exchange = create_exchange()
     params = RegimeParams()
     btc_1h = fetch_candles(exchange, "BTC/USDT", "1h", limit=1000)
+    print(f"Last closed 1h candle: {btc_1h.index[-1]:%Y-%m-%d %H:%M} UTC")
 
-    drops = btc_drop_pct(btc_1h, params.chaos_lookback_hours)
-    print(f"BTC drop from 4h high now: {drops.iloc[-1]:.2f}%")
-    print(f"Max drop in last {params.chaos_cooldown_hours}h: {drops.tail(params.chaos_cooldown_hours).max():.2f}%")
-    print(f"CHAOS now: {is_chaos(btc_1h, params)}")
-
-    crash_hours = drops[drops > params.chaos_drop_pct]
-    print(f"Hours with a crash signal in the last {len(btc_1h)} hours: {len(crash_hours)}")
-    print(crash_hours.round(2).tail(10))
-
-    print("--- SQUEEZE check (per coin) ---")
     for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT"]:
         df_1h = add_bollinger(fetch_candles(exchange, symbol, "1h", limit=1000))
-        rank = bb_width_percentile(df_1h, params.squeeze_lookback_hours)
-        print(f"{symbol:<9} bb_width={df_1h['bb_width'].iloc[-1]:.2f}%  rank={rank:.0f}/100  SQUEEZE={is_squeeze(df_1h, params)}")
-
-    print("--- TREND check (per coin, 4h) ---")
-    for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT"]:
         df_4h = fetch_candles(exchange, symbol, "4h", limit=1000)
         add_ema(df_4h, 50)
         add_adx(df_4h, 14)
-        last = df_4h.iloc[-1]
-        above_pct = (last["close"] - last["ema_50"]) / last["ema_50"] * 100
-        print(f"{symbol:<9} close_vs_ema50={above_pct:+.2f}%  adx_14={last['adx_14']:.1f}  TREND={is_trend(df_4h, params)}")
 
-    print(f"--- RANGE check (per coin, ADX 4h + {params.range_lookback_hours}h channel) ---")
-    for symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT"]:
-        df_4h = add_adx(fetch_candles(exchange, symbol, "4h", limit=1000), 14)
-        df_1h = fetch_candles(exchange, symbol, "1h", limit=1000)
-        width = channel_width_pct(df_1h, params.range_lookback_hours)
-        max_width = params.range_max_width_pct[symbol]
+        regime = detect_regime(symbol, btc_1h, df_1h, df_4h, params)
         print(
-            f"{symbol:<9} adx_14={df_4h.iloc[-1]['adx_14']:.1f}  channel={width:.2f}% (max {max_width:.0f}%)  "
-            f"RANGE={is_range(df_4h, df_1h, symbol, params)}"
+            f"{symbol:<9} chaos={is_chaos(btc_1h, params)!s:<5}  squeeze={is_squeeze(df_1h, params)!s:<5}  "
+            f"trend={is_trend(df_4h, params)!s:<5}  range={is_range(df_4h, df_1h, symbol, params)!s:<5}  "
+            f"=> {regime}"
         )
