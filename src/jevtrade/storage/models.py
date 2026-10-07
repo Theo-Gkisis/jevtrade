@@ -95,6 +95,21 @@ class JevDecisionRow(Base):
     error: Mapped[str | None] = mapped_column(String(500))           # why Jev could not be reached
 
 
+class CycleRow(Base):
+    """One row per hourly cycle: account value, market regimes and errors over time."""
+
+    __tablename__ = "cycles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    equity_usdt: Mapped[float | None]            # None if the cycle failed before measuring it
+    open_positions: Mapped[int | None]
+    regimes: Mapped[dict | None] = mapped_column(JSON)   # {"BTC/USDT": "TREND", ...}
+    signals_found: Mapped[int | None]
+    duration_ms: Mapped[int]
+    error: Mapped[str | None] = mapped_column(String(1000))
+
+
 def create_tables(engine: Engine) -> None:
     """Create any missing tables. Existing tables and their data are left untouched."""
     Base.metadata.create_all(engine)
@@ -111,6 +126,6 @@ if __name__ == "__main__":
     engine = create_db_engine()
     create_tables(engine)
     inspector = inspect(engine)
-    for table in ("signals", "positions", "trades", "jev_decisions"):
+    for table in ("signals", "positions", "trades", "jev_decisions", "cycles"):
         columns = [c["name"] for c in inspector.get_columns(table)]
         print(f"{table:<10} {len(columns)} columns: {', '.join(columns)}")

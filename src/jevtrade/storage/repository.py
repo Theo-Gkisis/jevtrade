@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from jevtrade.jev.client import JevAssessment
 from jevtrade.jev.policy import JevDecision
 from jevtrade.risk.limits import PortfolioState
-from jevtrade.storage.models import JevDecisionRow, PositionRow, SignalRow, TradeRow
+from jevtrade.storage.models import CycleRow, JevDecisionRow, PositionRow, SignalRow, TradeRow
 from jevtrade.strategies.signal import Signal
 
 
@@ -134,6 +134,31 @@ def close_position(
     session.delete(position)
     session.flush()
     return trade
+
+
+def record_cycle(
+    session: Session,
+    ran_at: datetime,
+    duration_ms: int,
+    equity_usdt: float | None = None,
+    open_positions_count: int | None = None,
+    regimes: dict[str, str] | None = None,
+    signals_found: int | None = None,
+    error: str | None = None,
+) -> CycleRow:
+    """Store one hourly cycle (a failed cycle has only ran_at, duration and error)."""
+    row = CycleRow(
+        ran_at=ran_at,
+        equity_usdt=equity_usdt,
+        open_positions=open_positions_count,
+        regimes=regimes,
+        signals_found=signals_found,
+        duration_ms=duration_ms,
+        error=error[:1000] if error else None,
+    )
+    session.add(row)
+    session.flush()
+    return row
 
 
 def realized_pnl_since(session: Session, since: datetime) -> float:

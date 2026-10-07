@@ -32,6 +32,7 @@ from jevtrade.storage.repository import (
     close_position,
     open_positions,
     portfolio_state,
+    record_cycle,
     record_jev_decision,
     record_signal,
     signal_exists,
@@ -214,9 +215,14 @@ def look_for_signals(
     prices: dict[str, float],
     params: BotParams,
     now: datetime,
-) -> None:
-    """Entries: regime -> strategy -> Jev -> risk limits -> market buy + protective OCO."""
+) -> tuple[dict[str, str], int]:
+    """Entries: regime -> strategy -> Jev -> risk limits -> market buy + protective OCO.
+
+    Returns the regime of every coin and how many new signals were found.
+    """
     btc_1h = data["BTC/USDT"][0]
+    regimes: dict[str, str] = {}
+    signals_found = 0
     jev = None
     if params.jev_mode == "enforce":
         try:
@@ -227,10 +233,12 @@ def look_for_signals(
     for symbol in params.symbols:
         df_1h, df_4h = data[symbol]
         regime = detect_regime(symbol, btc_1h, df_1h, df_4h, params.regime)
+        regimes[symbol] = str(regime)
         signal = find_signal(regime, symbol, df_1h, df_4h, params.strategies)
         log.info("%s regime=%s signal=%s", symbol, regime, signal.strategy if signal else "none")
         if signal is None or signal_exists(session, signal):
             continue
+        signals_found += 1
 
         # Second opinion: Jev may veto the trade or shrink its risk, never enlarge it
         jev_review = None
@@ -281,9 +289,12 @@ def look_for_signals(
             exit_at_market(session, exchange, position, now, "protection_failed", params.fee_pct)
         session.commit()
 
+    return regimes, signals_found
+
 
 def run_once(params: BotParams) -> None:
     now = datetime.now(UTC)
+    started = time.perf_counter()
     exchange = create_demo_exchange()
     exchange.load_markets()
     market = create_exchange()
@@ -297,10 +308,37 @@ def run_once(params: BotParams) -> None:
     with Session(engine) as session:
         manage_positions(session, exchange, data, prices, params, now)
         session.commit()
-        look_for_signals(session, exchange, data, prices, params, now)
+        regimes, signals_found = look_for_signals(session, exchange, data, prices, params, now)
         session.commit()
 
-    log.info("equity %.2f USDT", account_equity(exchange, prices))
+        equity = account_equity(exchange, prices)
+        record_cycle(
+            session,
+            ran_at=now,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            equity_usdt=equity,
+            open_positions_count=len(open_positions(session)),
+            regimes=regimes,
+            signals_found=signals_found,
+        )
+        session.commit()
+
+    log.info("equity %.2f USDT", equity)
+
+
+def record_failed_cycle(started_at: datetime, started: float, exc: Exception) -> None:
+    """Best effort: note a failed cycle in the database (the database itself may be what failed)."""
+    try:
+        with Session(create_db_engine()) as session:
+            record_cycle(
+                session,
+                ran_at=started_at,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            session.commit()
+    except Exception:
+        log.exception("could not record the failed cycle")
 
 
 def seconds_until_next_hour(delay_seconds: int = 60) -> float:
@@ -319,11 +357,13 @@ def main() -> None:
     params = BotParams()
 
     while True:
+        started_at, started = datetime.now(UTC), time.perf_counter()
         try:
             run_once(params)
-        except Exception:
+        except Exception as exc:
             # One bad cycle (network, exchange error) must not kill the loop; OCOs keep protecting positions
             log.exception("cycle failed")
+            record_failed_cycle(started_at, started, exc)
             if not args.loop:
                 raise
         if not args.loop:
