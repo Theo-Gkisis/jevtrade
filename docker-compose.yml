@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    image: jevtrade:latest
+    container_name: jevtrade
+    env_file: .env            # Binance demo keys, OpenRouter, Supabase, Telegram (kept only on the server)
+    restart: unless-stopped   # comes back after a crash or a reboot of the machine
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"       # keep logs from filling the small disk
+        max-file: "3"

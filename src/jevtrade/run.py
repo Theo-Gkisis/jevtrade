@@ -22,6 +22,8 @@ from jevtrade.execution.orders import cancel_oco, market_buy, place_exit_oco
 from jevtrade.indicators.technical import add_adx, add_atr, add_bollinger, add_ema, add_rsi, add_volume_ma
 from jevtrade.jev.client import JevAssessment, JevClient, build_state
 from jevtrade.jev.policy import JevDecision, JevPolicyParams, decide
+from jevtrade.notifications.summary import build_daily_summary
+from jevtrade.notifications.telegram import TelegramNotifier
 from jevtrade.regime.detector import RegimeParams, detect_regime
 from jevtrade.risk.limits import LimitParams, check_limits
 from jevtrade.risk.sizing import SizingParams, position_size
@@ -41,6 +43,23 @@ from jevtrade.strategies.signal import Signal
 from jevtrade.strategies.router import StrategyParams, find_signal
 
 log = logging.getLogger("jevtrade")
+_notifier: TelegramNotifier | None = None
+
+
+def notify(text: str) -> None:
+    """Send an event to Telegram (does nothing if Telegram is not configured, never raises)."""
+    global _notifier
+    if _notifier is None:
+        _notifier = TelegramNotifier()
+    _notifier.notify(text)
+
+
+def exit_message(trade, note: str = "") -> str:
+    icon = "💰" if trade.pnl_usdt >= 0 else "🔻"
+    return (
+        f"{icon} EXIT {trade.symbol} · {trade.exit_reason}{note}\n"
+        f"{trade.entry_price:,.2f} → {trade.exit_price:,.2f} · {trade.pnl_usdt:+,.2f} USDT · {trade.r_multiple:+.2f}R"
+    )
 
 
 @dataclass(frozen=True)
@@ -50,6 +69,7 @@ class BotParams:
     breakeven_at_r: float = 1.0     # move the stop to entry once the price has gone this many R up
     fee_pct: float = 0.1            # used to estimate exit fees (Binance spot taker fee)
     jev_mode: str = "enforce"       # "enforce": Jev can veto or shrink trades; "off": rules only
+    daily_summary_hour_utc: int = 6 # the cycle in this UTC hour also sends the daily Telegram summary (09:xx Greece)
     regime: RegimeParams = field(default_factory=RegimeParams)
     jev_policy: JevPolicyParams = field(default_factory=JevPolicyParams)
     strategies: StrategyParams = field(default_factory=StrategyParams)
@@ -108,6 +128,7 @@ def exit_at_market(session: Session, exchange: ccxt.binance, position: PositionR
     fee_usdt = fee_usdt or order["cost"] * fee_pct / 100
     trade = close_position(session, position, order["average"], fee_usdt, now, reason)
     log.info("EXIT %s reason=%s pnl=%+.2f USDT R=%+.2f", trade.symbol, reason, trade.pnl_usdt, trade.r_multiple)
+    notify(exit_message(trade))
 
 
 def sync_with_exchange(session: Session, exchange: ccxt.binance, position: PositionRow, now: datetime, fee_pct: float) -> bool:
@@ -127,9 +148,11 @@ def sync_with_exchange(session: Session, exchange: ccxt.binance, position: Posit
                 reason = "breakeven" if position.stop >= position.entry_price else "stop"
             trade = close_position(session, position, order["average"], order["cost"] * fee_pct / 100, now, reason)
             log.info("EXIT %s reason=%s pnl=%+.2f USDT R=%+.2f (filled by OCO)", trade.symbol, reason, trade.pnl_usdt, trade.r_multiple)
+            notify(exit_message(trade, " (filled by OCO)"))
             return True
 
     log.warning("OCO %s for %s is done but no leg filled (cancelled outside the bot?)", position.oco_order_list_id, position.symbol)
+    notify(f"⚠️ OCO {position.oco_order_list_id} for {position.symbol} ended without a fill. Cancelled outside the bot? Check the position.")
     return False
 
 
@@ -160,8 +183,16 @@ def ask_jev(
             signal.symbol, assessment.regime, assessment.regime_confidence, assessment.target_probability,
             assessment.news_risk, decision.action, decision.risk_multiplier, "; ".join(decision.reasons),
         )
+        icon = {"approve": "✅", "reduce": "⚠️", "reject": "❌"}[decision.action]
+        notify(
+            f"🤖 Jev on {signal.symbol}: {assessment.regime} ({assessment.regime_confidence:.2f}) · "
+            f"target probability {assessment.target_probability:.2f}\n"
+            f"{icon} {decision.action} ×{decision.risk_multiplier:.1f}"
+            + (f" · {'; '.join(decision.reasons)}" if decision.reasons else "")
+        )
     else:
         log.warning("JEV %s unavailable (%s) -> reject", signal.symbol, error)
+        notify(f"🤖 Jev unavailable for {signal.symbol} ({error}) → ❌ reject (fail-closed)")
     return state, assessment, decision, error
 
 
@@ -183,6 +214,7 @@ def manage_positions(
     state = portfolio_state(session, account_equity(exchange, prices), prices, now)
     if state.month_pnl_pct <= -params.limits.monthly_loss_limit_pct:
         log.warning("monthly loss %.2f%% hit the limit: closing everything", state.month_pnl_pct)
+        notify(f"🚨 Monthly loss {state.month_pnl_pct:.2f}% hit the -{params.limits.monthly_loss_limit_pct}% limit: closing every position")
         for position in open_positions(session):
             exit_at_market(session, exchange, position, now, "monthly_limit", params.fee_pct)
         return
@@ -206,6 +238,7 @@ def manage_positions(
             position.stop = position.entry_price
             position.oco_order_list_id = int(oco["orderListId"])
             log.info("BREAKEVEN %s stop moved to %.2f", symbol, position.stop)
+            notify(f"⚖️ {symbol} reached +{params.breakeven_at_r:g}R: stop moved to entry {position.stop:,.2f}")
 
 
 def look_for_signals(
@@ -229,6 +262,7 @@ def look_for_signals(
             jev = JevClient()
         except RuntimeError as exc:
             log.error("Jev client unavailable (%s): every signal will be rejected (fail-closed)", exc)
+            notify(f"⚠️ Jev client unavailable ({exc}): every signal will be rejected")
 
     for symbol in params.symbols:
         df_1h, df_4h = data[symbol]
@@ -239,6 +273,10 @@ def look_for_signals(
         if signal is None or signal_exists(session, signal):
             continue
         signals_found += 1
+        notify(
+            f"🔎 Signal {symbol} · {signal.strategy} · {regime}\n"
+            f"entry {signal.entry:,.2f} · stop {signal.stop:,.2f} · target {signal.target:,.2f} ({signal.reward_risk:.1f}R)"
+        )
 
         # Second opinion: Jev may veto the trade or shrink its risk, never enlarge it
         jev_review = None
@@ -268,6 +306,7 @@ def look_for_signals(
                 record_jev_decision(session, signal_row, jev_review[0], jev_review[1], jev_review[2], jev_review[3])
             session.commit()
             log.info("BLOCKED %s: %s", symbol, "; ".join(reasons))
+            notify(f"⛔ {symbol} blocked by risk limits: {'; '.join(reasons)}")
             continue
 
         buy = market_buy(exchange, symbol, cost)
@@ -280,12 +319,19 @@ def look_for_signals(
         position = add_position(session, signal_row, now, fill, quantity, fee_usdt, str(buy["id"]), None)
         log.info("BUY %s qty=%s @ %.2f (cost %.2f USDT) stop=%.2f target=%.2f", symbol, quantity, fill, buy["cost"], signal.stop, signal.target)
 
+        notify(
+            f"🛒 BUY {symbol} {quantity} @ {fill:,.2f} ({buy['cost']:,.2f} USDT · risk {size.risk_pct:.2f}%)\n"
+            f"stop {signal.stop:,.2f} · target {signal.target:,.2f}"
+        )
+
         try:
             oco = place_exit_oco(exchange, symbol, quantity, signal.stop, signal.target)
             position.oco_order_list_id = int(oco["orderListId"])
+            notify(f"🛡️ {symbol} protected at Binance by OCO #{position.oco_order_list_id}")
         except ccxt.BaseError as exc:
             # Never keep an unprotected position: sell it straight away
             log.error("could not place the OCO for %s (%s): exiting at market", symbol, exc)
+            notify(f"🚨 Could not protect {symbol} with an OCO ({exc}): selling it now")
             exit_at_market(session, exchange, position, now, "protection_failed", params.fee_pct)
         session.commit()
 
@@ -323,6 +369,9 @@ def run_once(params: BotParams) -> None:
         )
         session.commit()
 
+        if now.hour == params.daily_summary_hour_utc:
+            notify(build_daily_summary(session, now))
+
     log.info("equity %.2f USDT", equity)
 
 
@@ -353,8 +402,14 @@ def main() -> None:
     parser.add_argument("--loop", action="store_true", help="keep running, once per hour")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per HTTP request is noise
+    # httpx logs every request URL at INFO: noisy, and the Telegram URL contains the bot token
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     params = BotParams()
+    if args.loop:
+        notify(
+            f"🟢 jevtrade started · Binance Demo Trading · {', '.join(params.symbols)}\n"
+            f"Jev: {params.jev_mode} · risk {params.sizing.risk_per_trade_pct}%/trade · max {params.limits.max_open_positions} positions"
+        )
 
     while True:
         started_at, started = datetime.now(UTC), time.perf_counter()
@@ -364,6 +419,7 @@ def main() -> None:
             # One bad cycle (network, exchange error) must not kill the loop; OCOs keep protecting positions
             log.exception("cycle failed")
             record_failed_cycle(started_at, started, exc)
+            notify(f"⚠️ Cycle failed: {type(exc).__name__}: {str(exc)[:300]}\nOpen positions stay protected by their OCOs at Binance.")
             if not args.loop:
                 raise
         if not args.loop:

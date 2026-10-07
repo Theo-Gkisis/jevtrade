@@ -1,0 +1,11 @@
+# Never send secrets or local environments into the image
+.env
+.venv/
+.git/
+**/__pycache__/
+*.egg-info/
+build/
+dist/
+.vscode/
+docs/
+scripts/
